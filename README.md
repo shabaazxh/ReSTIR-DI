@@ -9,7 +9,10 @@ A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Re
   <img src="showcase/unbiased_restir.png" width="700">
 </p>
 
-<em align="center">(Top) RIS using WRS. (Bottom) Unbiased ReSTIR.</em><br><br>
+
+<p align="center">
+    <em>(Top) RIS using WRS. (Bottom) Unbiased ReSTIR.</em>
+</p>
 
 ## Building
 ### Windows
