@@ -1,5 +1,5 @@
 # ReSTIR-DI
-A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Resampling algorithm; written as part of MSc thesis
+A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Resampling algorithm; written as part of MSc thesis.
 
 <p align="center">
   <img src="showcase/no_restir.png" width="700">
@@ -26,9 +26,7 @@ A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Re
 make
 ./bin/Engine-release-x64-gcc.exe
 ```
-
-## Assets
-Find the Sponza GLTF https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza
-
 [Sponza] (https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza) GLTF
+
+<a href="https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza">Sponza</a> GLTF
 
