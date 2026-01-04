@@ -26,7 +26,6 @@ A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Re
 make
 ./bin/Engine-release-x64-gcc.exe
 ```
-[Sponza] (https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza) GLTF
-
-<a href="https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza">Sponza</a> GLTF
+## Assets
+The Sponza scene used in this proejct can be found <a href="https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza">here</a>.
 
