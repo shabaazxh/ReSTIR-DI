@@ -1,5 +1,5 @@
 # ReSTIR-DI
-A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Resampling algorithm; written as part of MSc thesis.
+A Vulkan renderer implementing the <a href="https://research.nvidia.com/sites/default/files/pubs/2020-07_Spatiotemporal-reservoir-resampling/ReSTIR.pdf">Reservoir-based Spatio-Temporal Importance Resampling</a> algorithm; written as part of MSc thesis.
 
 <p align="center">
   <img src="showcase/no_restir.png" width="700">
