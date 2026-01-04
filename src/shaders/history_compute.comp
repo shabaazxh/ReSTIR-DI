@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D renderedScene;       // Current noisy RTX output
+layout(set = 0, binding = 1, rgba16f) uniform image2D temporalAccumImage; // History buffer ( read / write )
+
+layout(set = 0, binding = 2) uniform RTXSettings
+{
+    int bounces;
+    int frameIndex;
+    int numPastFrames;
+} rtx;
+
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+
+    vec4 newColour = texelFetch(renderedScene, coords, 0);
+    vec4 history = imageLoad(temporalAccumImage, coords);
+
+    if(rtx.frameIndex > rtx.numPastFrames)
+        return;
+
+    if(rtx.frameIndex > 0)
+    {
+        float alpha = 1.0 / float(rtx.frameIndex + 1);
+        imageStore(temporalAccumImage, coords, mix(history, newColour, alpha));
+    }
+    else
+    {
+        imageStore(temporalAccumImage, coords, newColour);
+    }
+}

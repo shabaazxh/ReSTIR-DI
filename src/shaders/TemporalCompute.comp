@@ -1,0 +1,416 @@
+#version 460
+
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_ray_tracing : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int NUM_LIGHTS = 100;
+#define PI 3.14159265359
+#define LIGHT_INTENSITY 6000
+
+struct Light
+{
+	int Type;
+	vec4 LightPosition;
+	vec4 LightColour;
+	mat4 LightSpaceMatrix;
+};
+
+layout(set = 0, binding = 0) uniform TemporalPassUniforms
+{
+    int frameIndex;
+    vec2 viewportSize;
+    int M;
+    bool enableUnbiased;
+} temp_ubo;
+
+
+layout(set = 0, binding = 1) uniform LightBuffer {
+	Light lights[NUM_LIGHTS];
+} lightData;
+
+layout(set = 0, binding = 2) uniform sampler2D initial_candidates_texture;
+layout(set = 0, binding = 3) uniform sampler2D motion_vectors_texture;
+layout(set = 0, binding = 4) uniform sampler2D previous_frame_texture;
+layout(set = 0, binding = 5, rgba16f) uniform image2D reservoir_output_image;
+layout(set = 0, binding = 6) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 7) uniform sampler2D g_buffer_world_position;
+layout(set = 0, binding = 8) uniform sampler2D g_buffer_normals;
+layout(set = 0, binding = 10) uniform sampler2D g_albedo;
+layout(set = 0, binding = 11) uniform sampler2D g_metallic_roughness;
+
+layout(set = 0, binding = 9) uniform SceneUniform
+{
+	mat4 model;
+	mat4 view;
+	mat4 projection;
+    vec4 cameraPosition;
+    vec2 viewportSize;
+	float fov;
+	float nearPlane;
+	float farPlane;
+} ubo;
+
+// PBR Rendering based on learnings from:
+// Joey De Vries (2020). Learn OpenGL: Learn modern OpenGL graphics programming in a step-by-step fashion. Kendall & Welling.
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a      = roughness*roughness;
+    float a2     = a*a;
+    float NdotH  = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH*NdotH;
+
+    float num   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return num / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r*r) / 8.0;
+
+    float num   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return num / denom;
+}
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2  = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1  = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 GetLightRadiance(int light_index, vec3 normal,vec3 world_pos, vec3 albedo, float metallic, float roughness)
+{
+    vec3 N = normalize(normal);
+    vec3 V = normalize(ubo.cameraPosition.xyz - world_pos);
+
+    vec3 F0 = vec3(0.04);
+    F0 = mix(F0, albedo, metallic);
+
+    Light light = lightData.lights[light_index];
+    vec3 L = normalize(light.LightPosition.xyz - world_pos);
+    vec3 H = normalize(V + L);
+    float dist = length(light.LightPosition.xyz - world_pos);
+    float attenuation = 1.0 / (dist * dist);
+    vec3 radiance = light.LightColour.rgb * attenuation * LIGHT_INTENSITY;
+
+    // Cook-Torrance BRDF
+    float NDF = DistributionGGX(N, H, roughness);
+    float G   = GeometrySmith(N, V, L, roughness);
+    vec3 F    = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3 numerator    = NDF * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.001; // prevent divide by zero
+    vec3 specular     = numerator / denominator;
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - metallic;
+    float NdotL = max(dot(N, L), 0.0);
+    return (kD * albedo / PI + specular) * radiance * NdotL;
+}
+
+// Reference: https://github.com/NVIDIAGameWorks/RTXGI-DDGI/blob/main/samples/test-harness/shaders/include/Random.hlsl#L42
+uint WangHash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+uint Xorshift(uint seed)
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    seed ^= (seed << 13);
+    seed ^= (seed >> 17);
+    seed ^= (seed << 5);
+    return seed;
+}
+
+float GetRandomNumber(inout uint seed)
+{
+    seed = WangHash(seed);
+    return float(Xorshift(seed)) * (1.f / 4294967296.f);
+}
+
+vec2 GetRandomHashValue01(inout uint seed)
+{
+    float u = GetRandomNumber(seed);
+    float v = GetRandomNumber(seed);
+    return vec2(u, v);
+}
+
+
+vec2 GetRandomHashValue(inout uint seed)
+{
+    float u = GetRandomNumber(seed) * 2.0 - 1.0;
+    float v = GetRandomNumber(seed) * 2.0 - 1.0; // Seed is modified in-place
+    return vec2(u, v);
+}
+
+
+float inShadow(vec3 position, vec3 normal, float distToLight, vec3 lightDir)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS,
+                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0xFF,
+                          position + normal * 0.001, // offset to avoid self-intersection
+                          0.0,
+                          lightDir,
+                          distToLight);
+
+    while (rayQueryProceedEXT(rq)) {
+        // Just keep iterating until first hit or end
+    }
+    bool occluded = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+
+    return occluded ? 0.0 : 1.0;
+}
+
+struct Reservoir
+{
+    int index;
+    float W_y;
+    float W_sum;
+    int M;
+};
+
+void update(inout uint seed, inout Reservoir reservoir, in float xi_weight, int index, int in_reservoir_m)
+{
+    reservoir.W_sum = reservoir.W_sum + xi_weight;
+    float r = GetRandomNumber(seed);
+    reservoir.M += in_reservoir_m; // Algorithm 6: Line 4.
+    if(r < (xi_weight / reservoir.W_sum))
+    {
+        reservoir.index = index;
+    }
+}
+
+// @NOTE: Tip 3.4: Use 1 / M weights if and only if all inputs weights are identically distributed
+// If initial candidates have different PDFs, such as when reusing across pixels. When reusing
+// across pixels, if you're using different PDFs, the expectation is that nearby pixels might have used
+// A different PDF compared to the others thus, MIS is needed to compute a balance heuristic.
+
+// All these initial candidates used a uniform distribution i.e 1 / NUM_LIGHTS
+
+Reservoir combine_reservoirs(
+    vec4 current_pixel_reservoir_data,
+    inout uint seed,
+    vec3 n,
+    vec3 pos,
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    inout vec3 previous_pixel_position,
+    inout vec3 previous_pixel_normal,
+    inout vec3 previous_pixel_albedo,
+    inout float previous_metallic,
+    inout float previous_roughness,
+    inout int previous_pixel_reservoir_m,
+    inout bool isValidHistory
+    )
+{
+    // Init the reservoir which will be returned containing the new sample
+    Reservoir reservoir;;
+    reservoir.index = -1;
+    reservoir.W_y = 0.0;
+    reservoir.M = 0; // Number of candidates used during the initial candidates phase
+    reservoir.W_sum = 0.0;
+
+    // This will hold the two reservoirs, one for the current pixel and one for the previous frame pixel
+    Reservoir reservoirs[2];
+    for(int i = 0; i < 2; i++) {
+        reservoirs[i].index = -1;
+        reservoirs[i].W_y = 0.0;
+        reservoirs[i].M = 0;
+        reservoirs[i].W_sum = 0.0;
+    }
+
+    // Get the motion vector for the current pixel
+    vec2 motion_vector = texelFetch(motion_vectors_texture, ivec2(gl_GlobalInvocationID.xy), 0).xy;
+
+    // Get the previous frame pixel position by subtracting the motion vector from the current pixel position
+    ivec2 current_pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 previous_pixel = ivec2(current_pixel + (motion_vector * temp_ubo.viewportSize)); // motion_vector is difference between UV, we need it in pixels so multiply by viewportsize
+    // previous_pixel = clamp(previous_pixel, ivec2(0), ivec2(temp_ubo.viewportSize - vec2(1)));
+
+    if(temp_ubo.enableUnbiased) {
+        previous_pixel = ivec2(current_pixel);
+    }
+
+    // Store previous pixel position and normal
+    previous_pixel_position    = texelFetch(g_buffer_world_position, previous_pixel, 0).xyz;
+    previous_pixel_normal      = normalize(texelFetch(g_buffer_normals, previous_pixel, 0).xyz * 2.0 - 1.0);
+    previous_pixel_albedo      = texelFetch(g_albedo, previous_pixel, 0).rgb;
+    previous_metallic          = texelFetch(g_metallic_roughness, previous_pixel, 0).r;
+    previous_roughness         = texelFetch(g_metallic_roughness, previous_pixel, 0).g;
+
+    // Init reservoir with currnet pixel frame data
+    reservoirs[0].index = int(current_pixel_reservoir_data.x); // x = stores index into light array
+    reservoirs[0].W_y   = current_pixel_reservoir_data.y;      // y = reservoir W_y weight
+    reservoirs[0].M     = (int(current_pixel_reservoir_data.z)); // z = reservoir M
+
+    isValidHistory = dot(previous_pixel_normal, n) >= 0.99;
+
+    // Init reservoir with previous frame pixel data
+    if(isValidHistory) {
+        reservoirs[1].index = int(texelFetch(previous_frame_texture, previous_pixel, 0).x);
+        reservoirs[1].W_y   = texelFetch(previous_frame_texture, previous_pixel, 0).y;
+        reservoirs[1].M = min(int(texelFetch(previous_frame_texture, previous_pixel, 0).z), 20 * reservoirs[0].M); // Paper at the end suggests clamping M for temporal reuse
+        previous_pixel_reservoir_m = reservoirs[1].M;
+    }
+
+    for(int i = 0; i < 2; i++) {
+
+        Light L = lightData.lights[reservoirs[i].index];
+
+        // Evaluate F(x) at the current pixel
+        float F_x = length(GetLightRadiance(reservoirs[i].index, n, pos, albedo, metallic, roughness));
+
+        // Algorithm 4: Line: 4: p^q(r.y) * r.W * r.M
+        float w_i = F_x > 0.0 ? F_x * reservoirs[i].W_y * reservoirs[i].M : 0.0;
+
+        // Update the reservoir using current sample data
+        update(seed, reservoir, w_i, reservoirs[i].index, reservoirs[i].M);
+    }
+
+    return reservoir;
+}
+
+
+vec4 Temporal(vec3 n, vec3 pos, vec3 albedo, float metallic, float roughness)
+{
+    uvec2 dispatch_size = uvec2(temp_ubo.viewportSize / 8);
+    uint launch_width = dispatch_size.x * gl_WorkGroupSize.x;
+    uint seed = uint(gl_GlobalInvocationID.y * launch_width) + gl_GlobalInvocationID.x;
+    seed *= temp_ubo.frameIndex;
+
+    vec3 throughput = vec3(1.0);
+    vec4 curr_reservoir = texelFetch(initial_candidates_texture, ivec2(gl_GlobalInvocationID.xy), 0).rgba;
+
+    // Store previous pixel normal and position to perform visibility testing
+    vec3 previous_pixel_normal = vec3(0.0);
+    vec3 previous_pixel_position = vec3(0.0);
+    vec3 previous_pixel_albedo = vec3(0.0);
+    int  previous_pixel_reservoir_m = 0;
+    float previous_metallic = 0.0;
+    float previous_roughness = 0.0;
+
+    // Flag to ensure history is valid before using it
+    bool isValidHistory = true;
+
+    // Combine the reservoirs of the current and previous pixel
+    Reservoir reservoir =
+    combine_reservoirs(
+        curr_reservoir,
+        seed,
+        n,
+        pos,
+        albedo,
+        metallic,
+        roughness,
+        previous_pixel_position,
+        previous_pixel_normal,
+        previous_pixel_albedo,
+        previous_metallic,
+        previous_roughness,
+        previous_pixel_reservoir_m,
+        isValidHistory
+    );
+
+    // If the reservoir index is -1, no light was selected, return early
+    if(reservoir.index < 0) {
+        return vec4(-1.0, 0.0, 0.0, 0.0);
+    }
+
+    // The reservoir should now contain the new updated sample and it should be valid
+    // Use the index from the reservoir to fetch the light data
+    Light L = lightData.lights[reservoir.index];
+
+    /*
+        ====================== Algorithm 6: Unbiased combination of multiple reservoirs ======================
+        * Evaluate visibility at the previous pixel and the current pixel
+    */
+    int Z = 0;
+    // If the history sample is valid, compute f(x) to check visbility
+    if(isValidHistory && temp_ubo.enableUnbiased) {
+
+        // Compute F(x) for previous pixel + visibility
+        vec3  previous_pixel_lighting_direction = normalize(L.LightPosition.xyz - previous_pixel_position);
+        float previous_pixel_light_dist         = length(L.LightPosition.xyz - previous_pixel_position);
+
+        // Cast the shadow ray
+        float previous_pixel_visibility = inShadow(previous_pixel_position, previous_pixel_normal, previous_pixel_light_dist, previous_pixel_lighting_direction);
+
+        // Compute f(x) for the previous pixel
+        float previous_pixel_p_hat = length(GetLightRadiance(reservoir.index, previous_pixel_normal, previous_pixel_position, previous_pixel_albedo, previous_metallic, previous_roughness) * previous_pixel_visibility);
+
+        // If its not in shadow, add the previous pixels reservoir M to Z.
+        Z = previous_pixel_p_hat > 0.0 ? Z + previous_pixel_reservoir_m : Z;
+
+    }
+
+    // If unbiased is enabled, then compute the correction weight
+    if(temp_ubo.enableUnbiased) {
+        // Compute visibility using the new reservoir index but for the current pixel
+        vec3  current_pixel_light_direction = normalize(L.LightPosition.xyz - pos);
+        float current_pixel_light_dist = length(L.LightPosition.xyz - pos);
+
+        // Cast shadow ray for current pixel
+        float current_pixel_visibility = inShadow(pos, n, current_pixel_light_dist, current_pixel_light_direction);
+        // Compute f(x) for the current pixel
+        float current_pixel_p_hat = length(GetLightRadiance(reservoir.index, n, pos, albedo, metallic, roughness) * current_pixel_visibility);
+
+        // If the current pixel is not in shadow, add the current pixel reservoir M to Z.
+        Z = current_pixel_p_hat > 0.0 ? Z + int(curr_reservoir.z) : Z;
+    }
+
+    float m = (Z > 0.0) ? 1.0 / float(Z) : 0.0;
+
+    float F_x = length(GetLightRadiance(reservoir.index, n, pos, albedo, metallic, roughness));
+
+    if(!temp_ubo.enableUnbiased) {
+        // Algorithm 4: Line 6: Reservoir s: s.W = 1 / p^q(s.y) * ( 1 / s.M  * s.W_sum )
+        // (1.0 / F_x) is the reciprocal of the target function F(x) that PDF(X) approximates better with more candidates.
+        reservoir.W_y = F_x > 0.0 ? (1.0 / F_x) * (1.0 / reservoir.M) * reservoir.W_sum : 0.0;
+    } else
+    {
+        // Algorithm 6:
+        reservoir.W_y = F_x > 0.0 ? (1.0 / F_x) * (m * reservoir.W_sum) : 0.0;
+    }
+
+    return vec4(reservoir.index, reservoir.W_y, reservoir.M, 0.0);
+}
+
+void main() {
+
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+
+    // Get world and normal data
+    vec4 world_position = texelFetch(g_buffer_world_position, coords, 0);
+    vec3 world_normal   = normalize(texelFetch(g_buffer_normals, coords, 0).xyz * 2.0 - 1.0);
+    vec3 albedo = texelFetch(g_albedo, coords, 0).rgb;
+    float metallic = texelFetch(g_metallic_roughness, coords, 0).r;
+    float roughness = texelFetch(g_metallic_roughness, coords, 0).g;
+
+    vec4 reservoir_out = Temporal(world_normal.xyz, world_position.xyz, albedo, metallic, roughness);
+
+    imageStore(reservoir_output_image, coords, vec4(reservoir_out));
+}

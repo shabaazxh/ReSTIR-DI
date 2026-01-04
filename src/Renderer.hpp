@@ -1,0 +1,72 @@
+#pragma once
+
+// Creates command pool, command buffers
+#include <volk/volk.h>
+#include <memory>
+#include <vector>
+#include "PresentPass.hpp"
+#include "Scene.hpp"
+#include "Camera.hpp"
+#include "Composite.hpp"
+#include "History.hpp"
+#include "MotionVectors.hpp"
+#include "TemporalCompute.hpp"
+#include "SpatialCompute.hpp"
+#include "GBuffer.hpp"
+#include "Candidates.hpp"
+#include "ShadingPass.hpp"
+
+#include <fstream>
+
+namespace vk
+{
+	class Context;
+	class Renderer
+	{
+	public:
+		Renderer() = default;
+		Renderer(Context& context);
+
+		void Destroy();
+
+		void Render(double deltaTime);
+		void Update(double deltaTime);
+
+		// Should be moved out of renderer when we do better input/controls
+		static void glfwHandleKeyboard(GLFWwindow* window, int key, int scancode, int action, int mods);
+		static void glfwMouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+		static void glfwCallbackMotion(GLFWwindow* window, double x, double y);
+
+	private:
+		void CreateResources();
+		void CreateFences();
+		void CreateSemaphores();
+		void CreateCommandPool();
+		void AllocateCommandBuffers();
+
+		void Submit();
+		void Present(uint32_t imageIndex);
+
+	private:
+		Context& context;
+		std::vector<VkFence> m_Fences;
+		std::vector<VkSemaphore> m_imageAvailableSemaphores;
+		std::vector<VkSemaphore> m_renderFinishedSemaphores;
+		std::vector<VkCommandBuffer> m_commandBuffers;
+		std::vector<VkCommandPool> m_commandPool;
+
+		std::shared_ptr<Scene> m_scene;
+
+		std::unique_ptr<GBuffer>	      m_GBuffer;
+		std::unique_ptr<Candidates>       m_CandidatesPass;
+		std::unique_ptr<ShadingPass>      m_ShadingPass;
+		std::unique_ptr<Composite>        m_CompositePass;
+		std::unique_ptr<PresentPass>	  m_PresentPass;
+		std::unique_ptr<MotionVectors>    m_MotionVectorsPass;
+		std::unique_ptr<TemporalCompute>  m_TemporalComputePass;
+		std::unique_ptr<SpatialCompute>   m_SpatialComputePass;
+		std::unique_ptr<History>          m_HistoryPass;
+		std::shared_ptr<Camera> m_camera;
+		MaterialManager m_materialManager;
+	};
+}

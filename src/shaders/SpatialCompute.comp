@@ -1,0 +1,380 @@
+#version 460
+
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_ray_tracing : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int NUM_LIGHTS = 100;
+#define LIGHT_INTENSITY 6000
+#define PI 3.14159265359
+
+struct Light
+{
+	int Type;
+	vec4 LightPosition;
+	vec4 LightColour;
+	mat4 LightSpaceMatrix;
+};
+
+layout(set = 0, binding = 0) uniform SpatialPassUniforms
+{
+    int frameIndex;
+    vec2 viewportSize;
+    int M;
+    int radius;
+    bool enableUnbiased;
+} spatial_ubo;
+
+
+layout(set = 0, binding = 1) uniform LightBuffer {
+	Light lights[NUM_LIGHTS];
+} lightData;
+
+layout(set = 0, binding = 2) uniform sampler2D initial_candidates_texture;
+layout(set = 0, binding = 3) uniform sampler2D temporal_pass_reservoirs;
+layout(set = 0, binding = 4, rgba16f) uniform image2D reservoir_output_image;
+layout(set = 0, binding = 5) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 6) uniform sampler2D g_buffer_world_position;
+layout(set = 0, binding = 7) uniform sampler2D g_buffer_normals;
+layout(set = 0, binding = 8) uniform sampler2D g_albedo;
+layout(set = 0, binding = 10) uniform sampler2D g_metallic_roughness;
+
+layout(set = 0, binding = 9) uniform SceneUniform
+{
+	mat4 model;
+	mat4 view;
+	mat4 projection;
+    vec4 cameraPosition;
+    vec2 viewportSize;
+	float fov;
+	float nearPlane;
+	float farPlane;
+} ubo;
+
+// PBR Rendering based on learnings from:
+// Joey De Vries (2020). Learn OpenGL: Learn modern OpenGL graphics programming in a step-by-step fashion. Kendall & Welling.
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a      = roughness*roughness;
+    float a2     = a*a;
+    float NdotH  = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH*NdotH;
+
+    float num   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return num / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r*r) / 8.0;
+
+    float num   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return num / denom;
+}
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2  = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1  = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 GetLightRadiance(int light_index, vec3 normal, vec3 world_pos, vec3 albedo, float metallic, float roughness)
+{
+    vec3 N = normalize(normal);
+    vec3 V = normalize(ubo.cameraPosition.xyz - world_pos);
+
+    vec3 F0 = vec3(0.04);
+    F0 = mix(F0, albedo, metallic);
+
+    Light light = lightData.lights[light_index];
+    vec3 L = normalize(light.LightPosition.xyz - world_pos);
+    vec3 H = normalize(V + L);
+    float dist = length(light.LightPosition.xyz - world_pos);
+    float attenuation = 1.0 / (dist * dist);
+    vec3 radiance = light.LightColour.rgb * attenuation * LIGHT_INTENSITY;
+
+    // Cook-Torrance BRDF
+    float NDF = DistributionGGX(N, H, roughness);
+    float G   = GeometrySmith(N, V, L, roughness);
+    vec3 F    = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3 numerator    = NDF * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.001; // prevent divide by zero
+    vec3 specular     = numerator / denominator;
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - metallic;
+    float NdotL = max(dot(N, L), 0.0);
+    return (kD * albedo / PI + specular) * radiance * NdotL;
+}
+
+struct Reservoir
+{
+    int index;
+    float W_y;
+    float W_sum;
+    int M;
+};
+// Reference: https://github.com/NVIDIAGameWorks/RTXGI-DDGI/blob/main/samples/test-harness/shaders/include/Random.hlsl#L42
+uint WangHash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+uint Xorshift(uint seed)
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    seed ^= (seed << 13);
+    seed ^= (seed >> 17);
+    seed ^= (seed << 5);
+    return seed;
+}
+
+float GetRandomNumber(inout uint seed)
+{
+    seed = WangHash(seed);
+    return float(Xorshift(seed)) * (1.f / 4294967296.f);
+}
+
+vec2 GetRandomHashValue01(inout uint seed)
+{
+    float u = GetRandomNumber(seed);
+    float v = GetRandomNumber(seed);
+    return vec2(u, v);
+}
+
+vec2 GetRandomHashValue(inout uint seed)
+{
+    float u = GetRandomNumber(seed) * 2.0 - 1.0;
+    float v = GetRandomNumber(seed) * 2.0 - 1.0; // Seed is modified in-place
+    return vec2(u, v);
+}
+
+vec2 DiskPoint(float sampleRadius, float x, float y)
+{
+	float r = sampleRadius * sqrt(x);
+	float theta = y * (2.0 * PI);
+	return vec2(r * cos(theta), r * sin(theta));
+}
+
+float inShadow(vec3 position, vec3 normal, float distToLight, vec3 lightDir)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS,
+                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0xFF,
+                          position + normal * 0.001, // offset to avoid self intersection
+                          0.001,
+                          lightDir,
+                          distToLight);
+
+    while (rayQueryProceedEXT(rq)) {
+        // keep iterating until first hit or end
+    }
+    bool occluded = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+
+    return occluded ? 0.0 : 1.0;
+}
+
+void update(inout uint seed, inout Reservoir reservoir, in float xi_weight, int index, int in_reservoir_m)
+{
+    reservoir.W_sum = reservoir.W_sum + xi_weight;
+    float r = GetRandomNumber(seed);
+    reservoir.M += in_reservoir_m; // Algorithm 6: Line 4
+    if(r < (xi_weight / reservoir.W_sum))
+    {
+        reservoir.index = index;
+    }
+}
+
+Reservoir combine_reservoirs_spatial_reuse(vec4 current_pixel_reservoir_data, inout uint seed, vec3 n, vec3 pos, vec3 albedo, float metallic, float roughness, inout float m)
+{
+    const int NUM_SPATIAL_NEIGHBOURS = 4; // paper suggests 3 spatial neighbouring for unbiased algorithm
+    Reservoir reservoir;
+    reservoir.index = -1;
+    reservoir.W_y = 0.0;
+    reservoir.M = 0;
+    reservoir.W_sum = 0.0;
+
+    Reservoir neighbouring_reservoirs[NUM_SPATIAL_NEIGHBOURS]; // We will find 4 neighbours and fill this array
+    vec3 neighbouring_positions[NUM_SPATIAL_NEIGHBOURS];
+    vec3 neighbouring_normals[NUM_SPATIAL_NEIGHBOURS];
+    vec3 neighbouring_albedo[NUM_SPATIAL_NEIGHBOURS];
+    float neighbouring_metallic[NUM_SPATIAL_NEIGHBOURS];
+    float neighbouring_roughness[NUM_SPATIAL_NEIGHBOURS];
+
+    // Init all reservoirs
+    for(int i = 0; i < NUM_SPATIAL_NEIGHBOURS; i++)
+    {
+        neighbouring_reservoirs[i].index = -1;
+        neighbouring_reservoirs[i].W_y = 0.0f;
+        neighbouring_reservoirs[i].M = 0;
+        neighbouring_reservoirs[i].W_sum = 0.0f;
+        neighbouring_positions[i] = vec3(0.0);
+        neighbouring_normals[i] = vec3(0.0);
+        neighbouring_albedo[i] = vec3(0.0);
+        neighbouring_metallic[i] = 0.0f;
+        neighbouring_roughness[i] = 0.0f;
+    }
+
+    // current pixel reservoir
+    ivec2 current_pixel = ivec2(gl_GlobalInvocationID.xy);
+    neighbouring_reservoirs[0].index = int(current_pixel_reservoir_data.x); // Current pixel index
+    neighbouring_reservoirs[0].W_y = current_pixel_reservoir_data.y; // Current pixel weight
+    neighbouring_reservoirs[0].M = (int(current_pixel_reservoir_data.z)); // Current pixel M
+    neighbouring_positions[0] = pos;
+    neighbouring_normals[0] = n;
+    neighbouring_albedo[0] = albedo;
+    neighbouring_metallic[0] = metallic;
+    neighbouring_roughness[0] = roughness;
+
+    for(uint i = 1; i < NUM_SPATIAL_NEIGHBOURS; i++)
+    {
+        vec2 random = GetRandomHashValue01(seed);
+        vec2 offset = DiskPoint(float(spatial_ubo.radius), random.x, random.y); // radius of 30px, as suggested by the paper
+
+        ivec2 sample_pixel = current_pixel + ivec2(offset);
+        ivec2 viewportSizeInt = ivec2(spatial_ubo.viewportSize);
+        sample_pixel = clamp(sample_pixel, ivec2(0), viewportSizeInt - ivec2(1));
+
+        neighbouring_reservoirs[i].index = int(texelFetch(temporal_pass_reservoirs, sample_pixel, 0).x);
+        neighbouring_reservoirs[i].W_y   = texelFetch(temporal_pass_reservoirs, sample_pixel, 0).y;
+        neighbouring_reservoirs[i].M     = (int(texelFetch(temporal_pass_reservoirs, sample_pixel, 0).z));
+        neighbouring_positions[i]        = texelFetch(g_buffer_world_position, sample_pixel, 0).xyz;
+        neighbouring_normals[i]          = normalize(texelFetch(g_buffer_normals, sample_pixel, 0).xyz * 2.0 - 1.0);
+        neighbouring_albedo[i]           = texelFetch(g_albedo, sample_pixel, 0).xyz;
+        neighbouring_metallic[i]         = texelFetch(g_metallic_roughness, sample_pixel, 0).r;
+        neighbouring_roughness[i]        = texelFetch(g_metallic_roughness, sample_pixel, 0).g;
+    }
+
+    for(uint i = 0; i < NUM_SPATIAL_NEIGHBOURS; i++)
+    {
+        Light L = lightData.lights[neighbouring_reservoirs[i].index];
+
+        // Evaluate F(x) at the current pixel
+        float F_x = length(GetLightRadiance(neighbouring_reservoirs[i].index, n, pos, albedo, metallic, roughness));
+
+        // Algorithm 4: Line: 4: p^q(r.y) * r.W * r.M
+        float w_i = F_x > 0.0 ? F_x * neighbouring_reservoirs[i].W_y * neighbouring_reservoirs[i].M : 0.0;
+
+        // Update the reservoir using current sample data
+        update(seed, reservoir, w_i, neighbouring_reservoirs[i].index, neighbouring_reservoirs[i].M);
+    }
+
+    bool isValidReservoir = reservoir.index >= 0;
+    // If the reservoir is invalid, return an empty reservoir and set m to 0 since we won't evaluate visibility
+    if(!isValidReservoir)
+    {
+        reservoir.index = -1;
+        reservoir.W_y = 0.0f;
+        reservoir.M = 0;
+        reservoir.W_sum = 0.0f;
+        m = 0.0f; // No valid reservoir found, set m to 0
+        return reservoir;
+    }
+
+    // If unbiased is enabled, compute the correction weight m
+    if(spatial_ubo.enableUnbiased)
+    {
+        // The resampling process results in a final sample in the reservoir which can now be used.
+        Light L = lightData.lights[reservoir.index];
+
+        int Z = 0;
+        for(uint i = 0; i < NUM_SPATIAL_NEIGHBOURS; i++)
+        {
+            float light_dist = length(L.LightPosition.xyz - neighbouring_positions[i]);
+            vec3 lighting_direction = normalize(L.LightPosition.xyz - neighbouring_positions[i]);
+
+            float visibility = inShadow(neighbouring_positions[i], neighbouring_normals[i], light_dist, lighting_direction);
+            float pixel_p_hat = length(GetLightRadiance(reservoir.index, neighbouring_normals[i], neighbouring_positions[i], neighbouring_albedo[i], neighbouring_metallic[i], neighbouring_roughness[i]) * visibility);
+
+            Z = pixel_p_hat > 0.0 ? Z + neighbouring_reservoirs[i].M : Z;
+        }
+
+        m = (Z > 0.0) ? 1.0 / float(Z) : 1.0;
+    }
+
+    return reservoir;
+}
+
+// Spatial reuse begins here with this function
+void Spatial(vec3 n, vec3 pos, vec3 albedo, float metallic, float roughness)
+{
+    uvec2 dispatchSize = uvec2(spatial_ubo.viewportSize / 8);
+    uint launchWidth = dispatchSize.x * gl_WorkGroupSize.x;
+    uint seed = uint(gl_GlobalInvocationID.y * launchWidth) + gl_GlobalInvocationID.x;
+    seed *= spatial_ubo.frameIndex;
+
+    vec3 throughput = vec3(1.0);
+    vec4 pixelReservoir = texelFetch(temporal_pass_reservoirs, ivec2(gl_GlobalInvocationID.xy), 0).rgba;
+
+    float m = 0.0;
+    Reservoir reservoir = combine_reservoirs_spatial_reuse(pixelReservoir, seed, n, pos, albedo, metallic, roughness, m);
+    // reservoir.index = int(pixelReservoir.x); // The index of the light source in the reservoir
+    // reservoir.W_y = pixelReservoir.y; // The weight of the light source in the reservoir
+    // reservoir.M = int(pixelReservoir.z); // The number of samples in the reservoir
+
+    // The reservoir should now contain the new updated sample
+    // Use the index from the reservoir to fetch the light data
+    bool isValidReservoir = reservoir.index >= 0;
+
+    // If the reservoir is invalid, output a reservoir with no weight
+    if(!isValidReservoir) {
+        imageStore(reservoir_output_image, ivec2(gl_GlobalInvocationID.xy), vec4(-1, 0.0, 0, 0.0));
+        return;
+    }
+
+    float F_x = length(GetLightRadiance(reservoir.index, n, pos, albedo, metallic, roughness));
+
+    Light L = lightData.lights[reservoir.index];
+    vec3 LightDir = normalize(L.LightPosition.xyz - pos);
+    float dist = length(L.LightPosition.xyz - pos);
+
+    // float Visibility = inShadow(pos, n, dist, LightDir);
+    // Algorithm 4:
+    if(!spatial_ubo.enableUnbiased)
+    {
+        reservoir.W_y = F_x > 0.0 ? (1.0 / F_x) * (1.0 / reservoir.M) * reservoir.W_sum : 0.0;
+    } else
+    {
+    // Algorithm 6:
+        reservoir.W_y = F_x > 0.0 ? (1.0 / F_x) * (m * reservoir.W_sum) : 0.0; // m is the same as (1.0 / reservoir.M) from Alg 4 expects its the ones visible
+    }
+
+    imageStore(reservoir_output_image, ivec2(gl_GlobalInvocationID.xy), vec4(reservoir.index, reservoir.W_y, reservoir.M, 0.0));
+}
+
+void main() {
+
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+
+    // Get world and normal data
+    vec4 world_position = texelFetch(g_buffer_world_position, coords, 0);
+    vec3 world_normal   = normalize(texelFetch(g_buffer_normals, coords, 0).xyz * 2.0 - 1.0);
+    vec3 albedo = texelFetch(g_albedo, coords, 0).rgb;
+
+    float metallic = texelFetch(g_metallic_roughness, coords, 0).r;
+    float roughness = texelFetch(g_metallic_roughness, coords, 0).g;
+
+    Spatial(world_normal.xyz, world_position.xyz, albedo, metallic, roughness);
+}
