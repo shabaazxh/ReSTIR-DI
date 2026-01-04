@@ -1,5 +1,7 @@
 _build_
-assets/GLTF/Sponza
+assets/GLTF/Sponza/*
+!assets/GLTF/Sponza/
+!assets/GLTF/Sponza/defaultRoughness.jpg
 bin
 lib
 Makefile
