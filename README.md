@@ -3,22 +3,28 @@ A Vulkan renderer implementing the Reservoir-based Spatio-Temporal Importance Re
 
 
 ## Building
-# Windows
+### Windows
 ```bash
 ./premake5 vs2022
 ```
 
-# Linux
+### Linux
 ```bash
 ./premake5 gmake2
 make
 ./bin/Engine-release-x64-gcc.exe
 ```
 
-<img src="showcase/no_restir.png" width="700"/>
-<img src="showcase/biased_restir.png" width="700"/>
-<img src="showcase/unbiased_restir.png" width="700"/>
+<p align="center">
+  <img src="showcase/no_restir.png" width="700"><br>
+  <em>RIS using WRS</em><br><br>
 
+  <img src="showcase/biased_restir.png" width="700"><br>
+  <em>Biased ReSTIR</em><br><br>
+
+  <img src="showcase/unbiased_restir.png" width="700"><br>
+  <em>Unbiased ReSTIR</em>
+</p>
 
 
 ## Assets
