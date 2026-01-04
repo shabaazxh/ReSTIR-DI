@@ -27,5 +27,5 @@ make
 ./bin/Engine-release-x64-gcc.exe
 ```
 ## Assets
-The Sponza scene used in this proejct can be found <a href="https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza">here</a>.
+The Sponza scene used in this project can be found <a href="https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza">here</a>.
 
