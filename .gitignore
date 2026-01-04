@@ -2,3 +2,4 @@ _build_
 assets/GLTF/Sponza
 bin
 lib
+Makefile
